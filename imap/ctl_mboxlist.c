@@ -952,7 +952,9 @@ skip:
 enum {
     ROOT =      (1<<0),
     DOMAIN =    (1<<1),
-    MBOX =      (1<<2)
+    MBOX =      (1<<2),
+    UUID =      (1<<3),
+    MATCHED =   (1<<4)
 };
 
 struct found_data {
@@ -1054,39 +1056,38 @@ static int verify_cb(const mbentry_t *mbentry, void *rockp)
     // not pass dlist_parsemap() unlike is the case with dump_db().
 
     struct found_list *found = (struct found_list *) rockp;
-    int r = 0;
+    char* mb_identifier;
+    int r;
 
-    if (r) {
-        printf("'%s' has a directory '%s' but no DB entry\n",
-                found->data[found->idx].mboxname,
-                found->data[found->idx].path
-            );
-    } else {
-        // Walk the directories to see if the mailbox from data does have
-        // paths on the filesystem.
-        do {
-            r = -1;
-            if (
-                    (found->idx >= found->size) ||              /* end of array */
-                    !(found->data[found->idx].type & MBOX) ||   /* end of mailboxes */
-                    (r = strcmp(mbentry->name, found->data[found->idx].mboxname)) < 0
-            ) {
-                printf("'%s' has a DB entry but no directory on partition '%s'\n",
-                        mbentry->name, mbentry->partition);
+    if (mbentry->mbtype & MBTYPE_LEGACY_DIRS)
+        mb_identifier = mbentry->name;
+    else
+        mb_identifier = mbentry->uniqueid;
 
-            }
-            else if (r > 0) {
-                printf("'%s' has a directory '%s' but no DB entry\n",
-                        found->data[found->idx].mboxname,
-                        found->data[found->idx].path
-                    );
+printf("verify_cb: evaluation mailbox '%s' '%s' '%s'\n", mbentry->name, mbentry->uniqueid, mb_identifier);
 
-                found->idx++;
-            }
-            else found->idx++;
-        } while (r > 0);
+    // Walk the directories to see if the mailbox from data does have
+    // paths on the filesystem. Since Cyrus 3.6 there might be a mix
+    // of legacy and UUID mailboxes, so always traverse the whole list
+    for (int i = 0; i < found->size; i++) {
+        if (!(found->data[i].type & MBOX)) /* end of mailboxes */
+            break;
 
+        r = strcmp(mb_identifier, found->data[i].mboxname);
+
+printf("verify_cb: comparing mailbox '%s' with filesystem entry '%s' resulted in %d\n",
+    mb_identifier, found->data[i].mboxname, r);
+
+        if (r == 0) {
+            /* mark filesystem entry as matched */
+            found->data[i].type |= MATCHED;
+            return 0;
+        }
+        else if (r < 0) break;
     }
+
+    printf("'%s' has a DB entry but no directory on partition '%s'\n",
+            mbentry->name, mbentry->partition);
 
     return 0;
 }
@@ -1114,8 +1115,11 @@ static void do_verify(void)
         char path[MAX_MAILBOX_PATH+1];
         int type;
 
+printf("do_verify, for loop iteration on directory '%s' of type %d\n", found.data[i].path, found.data[i].type);
+
         if (config_hashimapspool && (found.data[i].type & ROOT)) {
             /* need to add hashed directories */
+printf("do_verify, root hash spool\n");
             int config_fulldirhash = libcyrus_config_getswitch(CYRUSOPT_FULLDIRHASH);
             char *tail;
             int j, c;
@@ -1139,15 +1143,24 @@ static void do_verify(void)
             for (j = 1; j < 26; j++, c++) {
                 *tail = c;
                 add_path(&found, type, name, part, path);
+printf("do_verify, add_path '%s'\n", path);
             }
 
             if (config_virtdomains && !type) {
                 /* need to add root domain directory */
                 strcpy(tail, "domain");
                 add_path(&found, DOMAIN | ROOT, name, part, path);
+printf("do_verify, add_path virtdomain '%s'\n", path);
+            }
+            if (1) {
+                /* need to add uuid directory */
+                strcpy(tail, "uuid");
+                add_path(&found, type | UUID, name, part, path);
+printf("do_verify, add_path for uuid %s'\n", path);
             }
         }
 
+printf("do_verify, opendir '%s' type %d\n", found.data[i].path, type);
         if (!(dirp = opendir(found.data[i].path))) continue;
         while ((dirent = readdir(dirp))) {
             const char *fname = FNAME_HEADER;
@@ -1155,26 +1168,35 @@ static void do_verify(void)
             else if (!strcmp(dirent->d_name, fname+1)) {
                 /* XXX - check that it can be opened */
                 found.data[i].type |= MBOX;
+                strcpy(name, found.data[i].mboxname);
+printf("do_verify, found type |= MBOX for '%s', new type %d name '%s'\n", found.data[i].path, found.data[i].type, name);
             }
             else if (!strchr(dirent->d_name, '.') ||
                      (found.data[i].type & DOMAIN)) {
                 /* probably a directory, add it to the array */
-                type = 0;
                 strcpy(name, found.data[i].mboxname);
 
                 if (config_virtdomains &&
                     (found.data[i].type == ROOT) &&
                     !strcmp(dirent->d_name, "domain")) {
                     /* root domain directory */
-                    type = DOMAIN | ROOT;
+printf("do_verify, found virt root domain for '%s'\n", found.data[i].path);
+                    type |= DOMAIN | ROOT;
                 }
                 else if (!name[0] && found.data[i].type & DOMAIN) {
+printf("do_verify, found toplevel domain for '%s'\n", found.data[i].path);
                     /* toplevel domain directory */
                     strcat(name, dirent->d_name);
                     strcat(name, "!");
-                    type = DOMAIN | ROOT;
+                    type |= DOMAIN | ROOT;
+                }
+                else if (found.data[i].type & UUID) {
+printf("do_verify, found UUID mailbox subdirectory candidate for '%s' (%s , %s)\n", found.data[i].path, name, dirent->d_name);
+                    /* possibly a mailbox directory, use directory name without ancestor information */
+                    strcpy(name, dirent->d_name);
                 }
                 else {
+printf("do_verify, found non-uuid mailbox subdirectory candidate for '%s'\n", found.data[i].path);
                     /* possibly a mailbox directory */
                     if (name[0] && !(found.data[i].type & DOMAIN)) strcat(name, ".");
                     strcat(name, dirent->d_name);
@@ -1184,7 +1206,10 @@ static void do_verify(void)
                 strcpy(path, found.data[i].path);
                 strcat(path, "/");
                 strcat(path, dirent->d_name);
+                /* inherit UUID flag from parent entry */
+                type = found.data[i].type & UUID;
                 add_path(&found, type, name, part, path);
+printf("do_verify, add_path type=%d, name=%s, part=%s, path=%s\n", type, name, part, path);
             }
         }
 
@@ -1194,6 +1219,17 @@ static void do_verify(void)
     qsort(found.data, found.size, sizeof(struct found_data), compar_mbox);
 
     mboxlist_allmbox("", &verify_cb, &found, MBOXTREE_TOMBSTONES);
+
+    /* now report all unmatched mailboxes found in filesystem */
+    for (i = 0; i < found.size; i++) {
+        if (!(found.data[i].type & MBOX)) break;
+        if (!(found.data[i].type & MATCHED)) {
+            printf("'%s' has a directory '%s' but no DB entry\n",
+                    found.data[i].mboxname,
+                    found.data[i].path
+                );
+        }
+    }
 }
 
 static void usage(void)
