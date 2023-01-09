@@ -1056,7 +1056,7 @@ static int mailbox_open_advanced(const char *name,
     if (mbe) mbentry = mboxlist_entry_copy(mbe);
     else r = mboxlist_lookup_allow_all(name, &mbentry, NULL);
 
-    if (!r && mbentry->mbtype & MBTYPE_DELETED)
+    if (!r && mbentry->mbtype & MBTYPE_DELETED && mbentry->partition == NULL)
         r = IMAP_MAILBOX_NONEXISTENT;
 
     if (r) {
